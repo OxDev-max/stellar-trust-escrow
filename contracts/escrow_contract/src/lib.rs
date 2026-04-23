@@ -2312,6 +2312,53 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Extends the deadline on an Active or Disputed escrow.
+    ///
+    /// Client may extend on Active escrows; arbiter may extend on Disputed escrows.
+    /// The new deadline must be strictly greater than the current deadline and in the future.
+    pub fn extend_deadline(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        new_deadline: u64,
+    ) -> Result<(), EscrowError> {
+        caller.require_auth();
+        ContractStorage::require_not_paused(&env)?;
+
+        let mut meta = ContractStorage::load_escrow_meta_with_rent(&env, escrow_id)?;
+
+        match meta.status {
+            EscrowStatus::Active => {
+                if caller != meta.client {
+                    return Err(EscrowError::Unauthorized);
+                }
+            }
+            EscrowStatus::Disputed => {
+                let arbiter = meta.arbiter.as_ref().ok_or(EscrowError::Unauthorized)?;
+                if &caller != arbiter {
+                    return Err(EscrowError::Unauthorized);
+                }
+            }
+            _ => return Err(EscrowError::EscrowNotActive),
+        }
+
+        let now = env.ledger().timestamp();
+        if new_deadline <= now {
+            return Err(EscrowError::DeadlineExpired);
+        }
+        if let Some(current) = meta.deadline {
+            if new_deadline <= current {
+                return Err(EscrowError::InvalidDeadline);
+            }
+        }
+
+        let old_deadline = meta.deadline;
+        meta.deadline = Some(new_deadline);
+        ContractStorage::save_escrow_meta(&env, &meta);
+        events::emit_deadline_extended(&env, escrow_id, old_deadline, new_deadline);
+        Ok(())
+    }
+
     // ── Cancellation Functions ─────────────────────────────────────────────────
 
     /// Requests cancellation of an escrow.
@@ -3998,5 +4045,115 @@ mod tests {
         let freelancer_authed = auths.iter().any(|(addr, _)| *addr == freelancer);
         assert!(client_authed, "client auth was not required");
         assert!(freelancer_authed, "freelancer auth was not required");
+    }
+
+    // ── extend_deadline tests ─────────────────────────────────────────────────
+
+    fn setup_escrow_for_deadline_tests() -> (
+        Env,
+        Address,
+        Address,
+        Address,
+        u64,
+        EscrowContractClient<'static>,
+    ) {
+        let (env, admin, _, client_contract) = setup();
+        client_contract.initialize(&admin);
+
+        let escrow_client = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+        let arbiter = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract_v2(admin.clone());
+        let token_id = token_contract.address();
+        token::StellarAssetClient::new(&env, &token_id)
+            .mint(&escrow_client, &(100_i128 + 2 * ContractStorage::reserve_for_entries(1)));
+
+        let escrow_id = client_contract.create_escrow(
+            &escrow_client,
+            &freelancer,
+            &token_id,
+            &100_i128,
+            &BytesN::from_array(&env, &[1; 32]),
+            &Some(arbiter.clone()),
+            &None,
+            &None,
+            &None,
+            &no_multisig(&env),
+        );
+
+        (env, escrow_client, freelancer, arbiter, escrow_id, client_contract)
+    }
+
+    #[test]
+    fn test_extend_deadline_by_client() {
+        let (env, escrow_client, _, _, escrow_id, client) = setup_escrow_for_deadline_tests();
+        let new_deadline = env.ledger().timestamp() + 1000;
+
+        client.extend_deadline(&escrow_client, &escrow_id, &new_deadline);
+
+        let state = client.get_escrow(&escrow_id);
+        assert_eq!(state.deadline, Some(new_deadline));
+    }
+
+    #[test]
+    fn test_extend_deadline_by_arbiter_in_dispute() {
+        let (env, escrow_client, freelancer, arbiter, escrow_id, client) =
+            setup_escrow_for_deadline_tests();
+
+        // Set an initial deadline via client
+        let initial_deadline = env.ledger().timestamp() + 500;
+        client.extend_deadline(&escrow_client, &escrow_id, &initial_deadline);
+
+        // Add + submit + dispute a milestone to put escrow in Disputed state
+        client.add_milestone(
+            &escrow_client,
+            &escrow_id,
+            &String::from_str(&env, "m1"),
+            &BytesN::from_array(&env, &[2; 32]),
+            &50_i128,
+        );
+        client.submit_milestone(&freelancer, &escrow_id, &0_u32);
+        client.raise_dispute(&escrow_client, &escrow_id, &Some(0_u32));
+
+        let new_deadline = initial_deadline + 1000;
+        client.extend_deadline(&arbiter, &escrow_id, &new_deadline);
+
+        let state = client.get_escrow(&escrow_id);
+        assert_eq!(state.deadline, Some(new_deadline));
+    }
+
+    #[test]
+    fn test_extend_deadline_rejects_past_deadline() {
+        let (env, escrow_client, _, _, escrow_id, client) = setup_escrow_for_deadline_tests();
+
+        // Set a future deadline first
+        let future = env.ledger().timestamp() + 1000;
+        client.extend_deadline(&escrow_client, &escrow_id, &future);
+
+        // Try to extend to a time before the current deadline — should fail
+        let shorter = future - 1;
+        let err = client.try_extend_deadline(&escrow_client, &escrow_id, &shorter);
+        assert_eq!(err.unwrap_err().unwrap(), EscrowError::InvalidDeadline);
+    }
+
+    #[test]
+    fn test_extend_deadline_rejects_past_timestamp() {
+        let (env, escrow_client, _, _, escrow_id, client) = setup_escrow_for_deadline_tests();
+
+        // Advance time, then try to set a deadline in the past
+        advance(&env, 2000);
+        let past = env.ledger().timestamp() - 1;
+        let err = client.try_extend_deadline(&escrow_client, &escrow_id, &past);
+        assert_eq!(err.unwrap_err().unwrap(), EscrowError::DeadlineExpired);
+    }
+
+    #[test]
+    fn test_extend_deadline_rejects_unauthorized_caller() {
+        let (env, _, _, _, escrow_id, client) = setup_escrow_for_deadline_tests();
+        let stranger = Address::generate(&env);
+        let new_deadline = env.ledger().timestamp() + 1000;
+
+        let err = client.try_extend_deadline(&stranger, &escrow_id, &new_deadline);
+        assert_eq!(err.unwrap_err().unwrap(), EscrowError::Unauthorized);
     }
 }
