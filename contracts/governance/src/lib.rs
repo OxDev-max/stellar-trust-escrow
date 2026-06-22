@@ -170,21 +170,32 @@ fn validate_parameter_payload(env: &Env, payload: &ParameterPayload) -> Result<(
 }
 
 /// Checks whether a proposal has reached quorum and approval threshold.
-fn evaluate(proposal: &Proposal, config: &GovConfig) -> bool {
-    let total_votes = proposal.votes_for + proposal.votes_against;
+#[deny(clippy::arithmetic_side_effects)]
+fn evaluate(proposal: &Proposal, config: &GovConfig) -> Result<bool, GovError> {
+    let total_votes = proposal
+        .votes_for
+        .checked_add(proposal.votes_against)
+        .ok_or(GovError::ArithmeticOverflow)?;
 
     // Quorum: enough participation?
-    let quorum_required = proposal.total_supply_snapshot * config.quorum_bps as i128 / 10_000;
+    let quorum_required = proposal
+        .total_supply_snapshot
+        .checked_mul(config.quorum_bps as i128)
+        .ok_or(GovError::ArithmeticOverflow)?
+        / 10_000;
     if total_votes < quorum_required {
-        return false;
+        return Ok(false);
     }
 
     // Approval threshold: enough FOR votes?
     if total_votes == 0 {
-        return false;
+        return Ok(false);
     }
-    let threshold_required = total_votes * config.approval_threshold_bps as i128 / 10_000;
-    proposal.votes_for >= threshold_required
+    let threshold_required = total_votes
+        .checked_mul(config.approval_threshold_bps as i128)
+        .ok_or(GovError::ArithmeticOverflow)?
+        / 10_000;
+    Ok(proposal.votes_for >= threshold_required)
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -250,6 +261,11 @@ impl GovernanceContract {
 
     // ── Proposal creation ─────────────────────────────────────────────────────
 
+    /// Upper bound for `supply_snapshot`. Chosen so that
+    /// `total_supply_snapshot * 10_000` (the widest bps multiplier used in
+    /// `evaluate`) can never overflow `i128`.
+    const MAX_SUPPLY_SNAPSHOT: i128 = i128::MAX / 10_000;
+
     /// Creates a new governance proposal.
     ///
     /// The caller must hold >= `proposal_threshold` tokens.
@@ -302,7 +318,7 @@ impl GovernanceContract {
         let vote_end = vote_start + config.voting_period;
         let executable_at = vote_end + config.timelock_delay;
 
-        if supply_snapshot < 0 {
+        if !(0..=Self::MAX_SUPPLY_SNAPSHOT).contains(&supply_snapshot) {
             return Err(GovError::InvalidParameter);
         }
 
@@ -354,6 +370,7 @@ impl GovernanceContract {
     /// * `voter`       - Must `require_auth()`.
     /// * `proposal_id` - Target proposal.
     /// * `support`     - `true` = vote FOR, `false` = vote AGAINST.
+    #[deny(clippy::arithmetic_side_effects)]
     pub fn cast_vote(
         env: Env,
         voter: Address,
@@ -389,9 +406,15 @@ impl GovernanceContract {
         }
 
         if support {
-            proposal.votes_for += power;
+            proposal.votes_for = proposal
+                .votes_for
+                .checked_add(power)
+                .ok_or(GovError::ArithmeticOverflow)?;
         } else {
-            proposal.votes_against += power;
+            proposal.votes_against = proposal
+                .votes_against
+                .checked_add(power)
+                .ok_or(GovError::ArithmeticOverflow)?;
         }
 
         Storage::mark_voted(&env, proposal_id, &voter);
@@ -425,7 +448,7 @@ impl GovernanceContract {
 
         let config = Storage::config(&env)?;
 
-        if evaluate(&proposal, &config) {
+        if evaluate(&proposal, &config)? {
             // Timelock: if delay is 0, go straight to Queued (executable now)
             proposal.status = ProposalStatus::Queued;
             events::emit_proposal_queued(&env, proposal_id, proposal.executable_at);
@@ -841,6 +864,7 @@ impl GovernanceContract {
     /// * `arbitrator`  — address to slash.
     /// * `recipient`   — receives the slashed tokens.
     /// * `reason`      — on-chain evidence string (IPFS hash or description).
+    #[deny(clippy::arithmetic_side_effects)]
     pub fn slash_arbitrator(
         env: Env,
         caller: Address,
@@ -866,12 +890,17 @@ impl GovernanceContract {
             return Err(GovError::NotArbitrator);
         }
 
-        let slash_amount = stake * Self::SLASH_PERCENT / 100;
+        let slash_amount = stake
+            .checked_mul(Self::SLASH_PERCENT)
+            .ok_or(GovError::ArithmeticOverflow)?
+            / 100;
         if slash_amount > stake {
             return Err(GovError::SlashExceedsStake);
         }
 
-        let remaining = stake - slash_amount;
+        let remaining = stake
+            .checked_sub(slash_amount)
+            .ok_or(GovError::ArithmeticOverflow)?;
 
         // Transfer slashed amount to recipient
         let config = Storage::config(&env)?;
